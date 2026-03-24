@@ -1,0 +1,53 @@
+# 配置文件中的敏感信息
+skill/config.sh
+config/config.sh
+
+# 数据和输出
+data/
+archives/
+
+# Chrome 缓存和配置
+~/
+chrome_debug_profile/
+chrome_persistent_profile/
+ChromeDebug/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+*~
+
+# 备份文件
+*.bak
+*.backup
+
+# 临时文件
+*.tmp
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# 可以安全分享的配置示例
+!skill/config.example.sh
+
+# 敏感信息 - API Keys和密钥
+.env
+.env.local
+.env.*.local
+*_api_key*
+*_secret*
+*_token*
