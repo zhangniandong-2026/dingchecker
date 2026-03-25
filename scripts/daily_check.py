@@ -96,9 +96,56 @@ def parse_timed_transcript_segments(raw_content: str):
     return segments
 
 
-def build_transcription_from_timed_segments(raw_content: str):
-    """根据时间轴片段重建更干净的正文转写。"""
-    segments = parse_timed_transcript_segments(raw_content)
+def parse_transcribe_row_segments(rows):
+    """从转写行结构中提取更稳定的发言片段。"""
+    if not rows:
+        return []
+
+    ignored_speakers = {"转写", "章节", "发言人", "AI纪要", "AI 纪要", "待办"}
+    segments = []
+
+    for row in rows:
+        if not row:
+            continue
+
+        lines = [line.strip() for line in str(row).splitlines() if line.strip()]
+        if not lines:
+            continue
+
+        timestamp_index = None
+        start_seconds = None
+        for index, line in enumerate(lines):
+            start_seconds = parse_timestamp_seconds(line)
+            if start_seconds is not None:
+                timestamp_index = index
+                break
+
+        if timestamp_index is None:
+            continue
+
+        speaker_candidates = [
+            line for line in lines[:timestamp_index]
+            if line not in ignored_speakers
+        ]
+        speaker = speaker_candidates[-1] if speaker_candidates else "未知发言人"
+        text = " ".join(lines[timestamp_index + 1:]).strip()
+
+        if not text:
+            continue
+
+        segments.append(
+            {
+                "speaker": speaker,
+                "start_seconds": start_seconds,
+                "text": text,
+            }
+        )
+
+    return segments
+
+
+def build_transcription_from_segments(segments):
+    """将结构化发言片段重新组织为干净正文。"""
     if len(segments) < 2:
         return None
 
@@ -115,10 +162,14 @@ def build_transcription_from_timed_segments(raw_content: str):
     return transcription if len(transcription) > 80 else None
 
 
-def extract_speech_discipline_alerts(raw_content: str, threshold_seconds: int = 120):
-    """基于转写时间戳识别超 2 分钟的连续发言。"""
+def build_transcription_from_timed_segments(raw_content: str):
+    """根据时间轴片段重建更干净的正文转写。"""
     segments = parse_timed_transcript_segments(raw_content)
+    return build_transcription_from_segments(segments)
 
+
+def extract_speech_discipline_alerts_from_segments(segments, threshold_seconds: int = 120):
+    """基于发言片段识别超 2 分钟的连续发言。"""
     if len(segments) < 2:
         return []
 
@@ -165,6 +216,139 @@ def extract_speech_discipline_alerts(raw_content: str, threshold_seconds: int = 
         )
 
     return alerts
+
+
+def extract_speech_discipline_alerts(raw_content: str, threshold_seconds: int = 120):
+    """基于转写时间戳识别超 2 分钟的连续发言。"""
+    segments = parse_timed_transcript_segments(raw_content)
+    return extract_speech_discipline_alerts_from_segments(segments, threshold_seconds)
+
+
+async def capture_transcribe_panel_text(content_page):
+    """滚动转写虚拟列表，尽量聚合完整正文。"""
+    try:
+        return await content_page.evaluate('''
+            async () => {
+                const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+                const root = (
+                    document.querySelector('.fm-transcribe-text__list') ||
+                    document.querySelector('.fm-transcribe-text') ||
+                    document.querySelector('[class*="transcribe"]')
+                );
+
+                if (!root) {
+                    return null;
+                }
+
+                const findViewport = () => {
+                    const directViewport = root.querySelector('[data-overlayscrollbars-viewport]');
+                    if (directViewport && directViewport.scrollHeight > directViewport.clientHeight + 40) {
+                        return directViewport;
+                    }
+
+                    const nestedScrollable = Array.from(root.querySelectorAll('*')).find((elem) => {
+                        const style = window.getComputedStyle(elem);
+                        return (
+                            (style.overflowY === 'scroll' || style.overflowY === 'auto') &&
+                            elem.scrollHeight > elem.clientHeight + 40
+                        );
+                    });
+                    if (nestedScrollable) {
+                        return nestedScrollable;
+                    }
+
+                    const hostViewport = document.querySelector('.fm-scroll-container [data-overlayscrollbars-viewport]');
+                    if (hostViewport && hostViewport.scrollHeight > hostViewport.clientHeight + 40) {
+                        return hostViewport;
+                    }
+
+                    return null;
+                };
+
+                const viewport = findViewport();
+                const rowMap = new Map();
+                const chunkMap = new Map();
+
+                const captureVisibleText = () => {
+                    const rows = Array.from(root.querySelectorAll('.fm-virtual-paragrah-row'));
+                    rows.forEach((row, index) => {
+                        const text = (row.innerText || '').trim();
+                        if (!text) {
+                            return;
+                        }
+                        const rowId = (row.id || '').trim();
+                        const key = rowId || `row-${index}-${text.slice(0, 24)}`;
+                        rowMap.set(key, text);
+                    });
+
+                    const chunkText = (root.innerText || '').trim();
+                    if (chunkText) {
+                        chunkMap.set(chunkText.slice(0, 120), chunkText);
+                    }
+                };
+
+                captureVisibleText();
+
+                if (viewport) {
+                    viewport.scrollTop = 0;
+                    await sleep(300);
+                    captureVisibleText();
+
+                    const step = Math.max(Math.floor(viewport.clientHeight * 0.75), 220);
+                    const maxLoops = 80;
+
+                    for (let loop = 0; loop < maxLoops; loop += 1) {
+                        const maxScrollTop = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
+                        if (viewport.scrollTop >= maxScrollTop) {
+                            break;
+                        }
+
+                        const nextTop = Math.min(viewport.scrollTop + step, maxScrollTop);
+                        if (nextTop <= viewport.scrollTop) {
+                            break;
+                        }
+
+                        viewport.scrollTop = nextTop;
+                        viewport.dispatchEvent(new Event('scroll', { bubbles: true }));
+                        await sleep(500);
+                        captureVisibleText();
+                    }
+
+                    viewport.scrollTop = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
+                    viewport.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    await sleep(500);
+                    captureVisibleText();
+                }
+
+                const orderedRows = Array.from(rowMap.entries())
+                    .sort((left, right) => {
+                        const leftNumber = Number(left[0]);
+                        const rightNumber = Number(right[0]);
+
+                        if (!Number.isNaN(leftNumber) && !Number.isNaN(rightNumber)) {
+                            return leftNumber - rightNumber;
+                        }
+
+                        return left[0].localeCompare(right[0]);
+                    })
+                    .map((entry) => entry[1]);
+
+                const orderedChunks = Array.from(chunkMap.values());
+                const aggregatedText = (orderedRows.length >= 3 ? orderedRows : orderedChunks).join('\\n').trim();
+
+                return {
+                    text: aggregatedText,
+                    rows: orderedRows,
+                    row_count: orderedRows.length,
+                    chunk_count: orderedChunks.length,
+                    used_virtual_list: Boolean(viewport),
+                    scroll_height: viewport ? viewport.scrollHeight : null,
+                    client_height: viewport ? viewport.clientHeight : null,
+                };
+            }
+        ''')
+    except Exception:
+        return None
 
 
 def should_generate_txt_report():
@@ -747,8 +931,20 @@ async def extract_content_for_current_sheet(page, target_date):
             except Exception as e:
                 print(f"  ⚠️ 切换标签页失败: {e}")
 
-            raw_page_text = await content_page.evaluate('() => document.body.innerText')
-            timed_transcription = build_transcription_from_timed_segments(raw_page_text)
+            transcribe_capture = await capture_transcribe_panel_text(content_page)
+            row_segments = parse_transcribe_row_segments(
+                transcribe_capture.get('rows') if transcribe_capture else None
+            )
+            raw_page_text = (
+                transcribe_capture.get('text')
+                if transcribe_capture and transcribe_capture.get('text')
+                else await content_page.evaluate('() => document.body.innerText')
+            )
+            timed_transcription = (
+                build_transcription_from_segments(row_segments)
+                if row_segments
+                else build_transcription_from_timed_segments(raw_page_text)
+            )
 
             # 提取内容（只提取转写标签页的内容）
             content = await content_page.evaluate('''
@@ -833,7 +1029,19 @@ async def extract_content_for_current_sheet(page, target_date):
                 }
             ''')
             
-            discipline_alerts = extract_speech_discipline_alerts(raw_page_text or content)
+            if transcribe_capture and transcribe_capture.get('text'):
+                content = transcribe_capture.get('text')
+                if transcribe_capture.get('used_virtual_list'):
+                    print(
+                        f"  ✓ 已聚合转写全文（{transcribe_capture.get('row_count', 0)} 段，"
+                        f"{len(content)} 字符）"
+                    )
+
+            discipline_alerts = (
+                extract_speech_discipline_alerts_from_segments(row_segments)
+                if row_segments
+                else extract_speech_discipline_alerts(raw_page_text or content)
+            )
 
             used_timed_transcription = False
             if timed_transcription:
