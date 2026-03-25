@@ -4,18 +4,176 @@ import asyncio
 import sys
 import re
 import os
+import json
+import shutil
 from playwright.async_api import async_playwright
 from datetime import datetime, date
 
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
+from cdp_helper import connect_browser_over_cdp
+from gemini_sdk import GEMINI_AVAILABLE, generate_text
+from report_data import build_report_data, render_text_report
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TIMESTAMP_LINE_RE = re.compile(r'^\[?(\d{1,2}):(\d{2})(?::(\d{2}))?\]?$')
+
+
+def parse_timestamp_seconds(line: str):
+    """将 00:00 / 00:00:00 格式转成秒。"""
+    match = TIMESTAMP_LINE_RE.match((line or "").strip())
+    if not match:
+        return None
+
+    first = int(match.group(1))
+    second = int(match.group(2))
+    third = match.group(3)
+    if third is None:
+        return first * 60 + second
+    return first * 3600 + second * 60 + int(third)
+
+
+def format_timestamp_label(total_seconds: int) -> str:
+    """将秒数转为易读时间。"""
+    total_seconds = max(int(total_seconds or 0), 0)
+    hours, remain = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remain, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def parse_timed_transcript_segments(raw_content: str):
+    """从带时间轴的转写文本中提取发言片段。"""
+    if not raw_content:
+        return []
+
+    ignored_speakers = {"转写", "章节", "发言人", "AI纪要", "AI 纪要", "待办"}
+    lines = [line.strip() for line in raw_content.splitlines() if line.strip()]
+    segments = []
+    index = 0
+
+    while index < len(lines):
+        start_seconds = parse_timestamp_seconds(lines[index])
+        if start_seconds is None:
+            index += 1
+            continue
+
+        cursor = index + 1
+        speaker = ""
+        speaker_candidates = []
+        speech_lines = []
+        while cursor < len(lines) and parse_timestamp_seconds(lines[cursor]) is None:
+            line = lines[cursor]
+            if not speaker and not speech_lines:
+                if line in ignored_speakers:
+                    cursor += 1
+                    continue
+                if len(line) <= 30:
+                    speaker_candidates.append(line)
+                    cursor += 1
+                    continue
+                speaker = speaker_candidates[-1] if speaker_candidates else "未知发言人"
+                speech_lines.append(line)
+            else:
+                if not speaker:
+                    speaker = speaker_candidates[-1] if speaker_candidates else "未知发言人"
+                speech_lines.append(line)
+            cursor += 1
+
+        if not speaker and speaker_candidates:
+            speaker = speaker_candidates[-1]
+
+        if speaker and cursor < len(lines):
+            segments.append(
+                {
+                    "speaker": speaker,
+                    "start_seconds": start_seconds,
+                    "text": " ".join(speech_lines).strip(),
+                }
+            )
+
+        index = cursor
+
+    return segments
+
+
+def build_transcription_from_timed_segments(raw_content: str):
+    """根据时间轴片段重建更干净的正文转写。"""
+    segments = parse_timed_transcript_segments(raw_content)
+    if len(segments) < 2:
+        return None
+
+    lines = []
+    for segment in segments:
+        speaker = segment.get("speaker", "").strip()
+        text = segment.get("text", "").strip()
+        if not speaker or not text:
+            continue
+        lines.append(speaker)
+        lines.append(text)
+
+    transcription = "\n".join(lines).strip()
+    return transcription if len(transcription) > 80 else None
+
+
+def extract_speech_discipline_alerts(raw_content: str, threshold_seconds: int = 120):
+    """基于转写时间戳识别超 2 分钟的连续发言。"""
+    segments = parse_timed_transcript_segments(raw_content)
+
+    if len(segments) < 2:
+        return []
+
+    turns = []
+    for current, following in zip(segments, segments[1:]):
+        duration_seconds = following["start_seconds"] - current["start_seconds"]
+        if duration_seconds <= 0 or duration_seconds > 3600:
+            continue
+
+        if (
+            turns
+            and turns[-1]["speaker"] == current["speaker"]
+            and turns[-1]["end_seconds"] == current["start_seconds"]
+        ):
+            turns[-1]["end_seconds"] = following["start_seconds"]
+            turns[-1]["duration_seconds"] += duration_seconds
+            if not turns[-1]["excerpt"] and current["text"]:
+                turns[-1]["excerpt"] = current["text"][:120]
+            continue
+
+        turns.append(
+            {
+                "speaker": current["speaker"],
+                "start_seconds": current["start_seconds"],
+                "end_seconds": following["start_seconds"],
+                "duration_seconds": duration_seconds,
+                "excerpt": current["text"][:120],
+            }
+        )
+
+    alerts = []
+    for turn in turns:
+        if turn["duration_seconds"] <= threshold_seconds:
+            continue
+        alerts.append(
+            {
+                "speaker": turn["speaker"],
+                "start_label": format_timestamp_label(turn["start_seconds"]),
+                "end_label": format_timestamp_label(turn["end_seconds"]),
+                "duration_seconds": turn["duration_seconds"],
+                "duration_label": f"{turn['duration_seconds'] // 60}分{turn['duration_seconds'] % 60:02d}秒",
+                "excerpt": turn["excerpt"],
+            }
+        )
+
+    return alerts
+
+
+def should_generate_txt_report():
+    """兼容文本报告默认关闭，可按需开启。"""
+    return os.environ.get('DINGCHECK_GENERATE_TXT', '0') == '1' or os.environ.get('DINGCHECK_GENERATE_PDF', '0') == '1'
 
 def load_business_units_with_groups():
     """从配置文件加载业务单元列表，同时保留分组信息"""
-    config_file = os.path.expanduser("~/repos/dingcheck/config/business_units.txt")
+    config_file = os.path.join(PROJECT_ROOT, "config", "business_units.txt")
     units = []
     groups = {}  # {unit_name: group_name}
     current_group = "未分组"
@@ -215,77 +373,45 @@ async def extract_content_for_current_sheet(page, target_date):
                 await page.wait_for_timeout(1000)
 
         if not target_frame:
-            return "无表格", None
+            return "无表格", None, []
 
-        # 策略：找到日期元素，然后模拟点击右侧的链接
+        async def page_looks_like_transcribe(target_page):
+            """判断页面是否已经进入 AI 听记详情。"""
+            try:
+                signals = await target_page.evaluate(
+                    """() => {
+                        const text = (document.body && document.body.innerText) || '';
+                        return {
+                            text: text,
+                            hasTab: text.includes('转写'),
+                            hasSummary: text.includes('AI 纪要') || text.includes('AI纪要'),
+                            hasTodo: text.includes('待办'),
+                            hasSpeaker: text.includes('发言人'),
+                        };
+                    }"""
+                )
+            except Exception:
+                return False
+
+            text = signals.get('text', '')
+            return any(
+                [
+                    signals.get('hasTab'),
+                    signals.get('hasSummary'),
+                    signals.get('hasTodo'),
+                    signals.get('hasSpeaker'),
+                    'shanji.dingtalk.com' in (target_page.url or ''),
+                    ('transcribes' in (target_page.url or '')),
+                    ('permission' in (target_page.url or '')),
+                    ('AI 纪要' in text or 'AI纪要' in text),
+                ]
+            )
+
+        # 策略：找到日期元素，然后尝试点击同一行右侧的候选入口
         result = await target_frame.evaluate('''
             (targetDate) => {
-                // 1. 查找目标日期元素
-                function findDateElement() {
-                    const allElements = document.querySelectorAll('*');
-                    for (const elem of allElements) {
-                        if (elem.children.length === 0) {
-                            const text = elem.textContent.trim();
-                            if (text === targetDate) {
-                                return elem;
-                            }
-                        }
-                    }
-                    return null;
-                }
-
-                const dateElement = findDateElement();
-                if (!dateElement) {
-                    return { success: false, reason: 'date-not-found' };
-                }
-
-                // 2. 滚动到该元素
-                dateElement.scrollIntoView({ behavior: 'auto', block: 'center' });
-
-                // 3. 获取日期元素的位置
-                const dateRect = dateElement.getBoundingClientRect();
-                const dateY = dateRect.top + dateRect.height / 2;
-                const dateRight = dateRect.right;
-
-                // 4. 查找右侧的链接元素
-                const allLinks = document.querySelectorAll('a, [role="link"]');
-                const candidates = [];
-
-                for (const link of allLinks) {
-                    const linkRect = link.getBoundingClientRect();
-                    const linkY = linkRect.top + linkRect.height / 2;
-                    const linkX = linkRect.left;
-                    const text = link.textContent.trim();
-                    const href = link.href || '';
-
-                    // 条件：Y坐标接近（同一行，缩小到20像素内）且在日期右侧
-                    if (Math.abs(linkY - dateY) < 20 && linkX > dateRight - 100) {
-                        // 必须是shanji.dingtalk.com的链接
-                        if (href.includes('shanji.dingtalk.com')) {
-                            candidates.push({
-                                element: link,
-                                text: text,
-                                href: href,
-                                distanceX: linkX - dateRight,
-                                distanceY: Math.abs(linkY - dateY)
-                            });
-                        }
-                    }
-                }
-
-                if (candidates.length === 0) {
-                    return { success: false, reason: 'link-not-found', dateY: dateY };
-                }
-
-                // 5. 按距离排序，选择最近的
-                candidates.sort((a, b) => {
-                    const distA = Math.sqrt(a.distanceX ** 2 + a.distanceY ** 2);
-                    const distB = Math.sqrt(b.distanceX ** 2 + b.distanceY ** 2);
-                    return distA - distB;
-                });
-
-                // 6. 返回要点击的元素的XPath
                 function getXPath(element) {
+                    if (!element) return '';
                     if (element.id) return `//*[@id="${element.id}"]`;
                     const parts = [];
                     while (element && element.nodeType === Node.ELEMENT_NODE) {
@@ -306,90 +432,251 @@ async def extract_content_for_current_sheet(page, target_date):
                     return parts.length ? '/' + parts.reverse().join('/') : '';
                 }
 
+                // 1. 查找目标日期元素
+                function findDateElement() {
+                    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+                    const matches = [];
+                    const allElements = document.querySelectorAll('*');
+
+                    for (const elem of allElements) {
+                        if (elem.children.length !== 0) {
+                            continue;
+                        }
+
+                        const text = elem.textContent.trim();
+                        if (text !== targetDate) {
+                            continue;
+                        }
+
+                        const rect = elem.getBoundingClientRect();
+                        const visible =
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            rect.bottom > 0 &&
+                            rect.top < viewportHeight;
+
+                        matches.push({
+                            element: elem,
+                            rectTop: rect.top,
+                            rectLeft: rect.left,
+                            visible: visible,
+                        });
+                    }
+
+                    if (matches.length === 0) {
+                        return null;
+                    }
+
+                    matches.sort((a, b) => {
+                        if (a.visible !== b.visible) {
+                            return a.visible ? -1 : 1;
+                        }
+                        if (a.rectTop !== b.rectTop) {
+                            return b.rectTop - a.rectTop;
+                        }
+                        return a.rectLeft - b.rectLeft;
+                    });
+
+                    return matches[0].element;
+                }
+
+                const dateElement = findDateElement();
+                if (!dateElement) {
+                    return { success: false, reason: 'date-not-found' };
+                }
+
+                // 2. 滚动到该元素
+                dateElement.scrollIntoView({ behavior: 'auto', block: 'center' });
+
+                // 3. 获取日期元素的位置
+                const dateRect = dateElement.getBoundingClientRect();
+                const dateY = dateRect.top + dateRect.height / 2;
+                const dateRight = dateRect.right;
+
+                // 4. 查找右侧的可点击候选元素
+                const allElements = document.querySelectorAll('*');
+                const candidates = [];
+                const seenXPaths = new Set();
+
+                function pickClickableTarget(element) {
+                    let current = element;
+                    while (current && current !== document.body) {
+                        const href = current.getAttribute('href') || '';
+                        const role = current.getAttribute('role') || '';
+                        const tag = current.tagName || '';
+                        const cursor = getComputedStyle(current).cursor;
+                        const clickable = (
+                            tag === 'A' ||
+                            tag === 'BUTTON' ||
+                            role === 'link' ||
+                            role === 'button' ||
+                            typeof current.onclick === 'function' ||
+                            href ||
+                            cursor === 'pointer'
+                        );
+                        if (clickable) {
+                            return current;
+                        }
+                        current = current.parentElement;
+                    }
+                    return element;
+                }
+
+                for (const rawElement of allElements) {
+                    const rect = rawElement.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) {
+                        continue;
+                    }
+
+                    const centerY = rect.top + rect.height / 2;
+                    const centerX = rect.left + rect.width / 2;
+                    if (Math.abs(centerY - dateY) >= 24 || centerX <= dateRight - 120) {
+                        continue;
+                    }
+
+                    const target = pickClickableTarget(rawElement);
+                    if (!target) {
+                        continue;
+                    }
+
+                    const targetRect = target.getBoundingClientRect();
+                    if (targetRect.width <= 0 || targetRect.height <= 0) {
+                        continue;
+                    }
+
+                    const xpath = getXPath(target);
+                    if (!xpath || seenXPaths.has(xpath)) {
+                        continue;
+                    }
+                    seenXPaths.add(xpath);
+
+                    const href = target.getAttribute('href') || target.href || '';
+                    const text = (target.innerText || target.textContent || '').trim();
+                    const role = target.getAttribute('role') || '';
+                    const tag = target.tagName || '';
+                    const cursor = getComputedStyle(target).cursor;
+                    const distanceX = targetRect.left - dateRight;
+                    const distanceY = Math.abs((targetRect.top + targetRect.height / 2) - dateY);
+                    const likelyMeetingEntry = (
+                        href.includes('shanji.dingtalk.com') ||
+                        text.includes('查看') ||
+                        text.includes('听记') ||
+                        text.includes('纪要') ||
+                        text.includes('会议')
+                    );
+
+                    candidates.push({
+                        xpath: xpath,
+                        text: text,
+                        href: href,
+                        role: role,
+                        tag: tag,
+                        cursor: cursor,
+                        distanceX: distanceX,
+                        distanceY: distanceY,
+                        likelyMeetingEntry: likelyMeetingEntry,
+                    });
+                }
+
+                if (candidates.length === 0) {
+                    return { success: false, reason: 'link-not-found', dateY: dateY };
+                }
+
+                // 5. 优先靠近日期、且更像会议入口的候选元素
+                candidates.sort((a, b) => {
+                    if (a.likelyMeetingEntry !== b.likelyMeetingEntry) {
+                        return a.likelyMeetingEntry ? -1 : 1;
+                    }
+                    const distA = Math.sqrt(a.distanceX ** 2 + a.distanceY ** 2);
+                    const distB = Math.sqrt(b.distanceX ** 2 + b.distanceY ** 2);
+                    return distA - distB;
+                });
+
                 return {
                     success: true,
-                    xpath: getXPath(candidates[0].element),
-                    linkText: candidates[0].text,
-                    candidatesCount: candidates.length
+                    candidates: candidates.slice(0, 8),
                 };
             }
         ''', target_date)
 
         if not result.get('success'):
-            return "无", None
+            return "无", None, []
 
-        # 点击链接
+        # 点击候选入口，兼容新标签页和当前页跳转两种行为
         try:
-            # 记录点击前的所有页面URL
-            initial_urls = set(pg.url for pg in page.context.pages)
+            content_page = None
+            link_url = None
 
-            # 通过XPath定位并点击元素
-            click_result = await target_frame.evaluate(f'''
-                (xpath) => {{
-                    const element = document.evaluate(xpath, document, null,
-                        XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                    if (element) {{
+            for candidate in result.get('candidates', []):
+                initial_pages = list(page.context.pages)
+                initial_page_urls = {pg: pg.url for pg in initial_pages}
+
+                click_result = await target_frame.evaluate(
+                    '''
+                    (xpath) => {
+                        const element = document.evaluate(xpath, document, null,
+                            XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        if (!element) {
+                            return false;
+                        }
+                        element.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' });
                         element.click();
                         return true;
-                    }}
-                    return false;
-                }}
-            ''', result['xpath'])
+                    }
+                    ''',
+                    candidate['xpath'],
+                )
 
-            if not click_result:
-                return "无", None
+                if not click_result:
+                    continue
 
-            # 等待新标签页打开，最多等待10秒
-            link_url = None
-            new_page = None
+                for _ in range(24):  # 24次 × 500ms = 12秒
+                    await page.wait_for_timeout(500)
 
-            for _ in range(20):  # 20次 × 500ms = 10秒
-                await page.wait_for_timeout(500)
+                    for pg in page.context.pages:
+                        if pg not in initial_pages:
+                            if await page_looks_like_transcribe(pg):
+                                content_page = pg
+                                break
 
-                # 检查是否有新打开的页面
-                for pg in page.context.pages:
-                    if pg.url not in initial_urls:
-                        new_page = pg
-
-                        # 情况1: 真正的听记链接
-                        if 'shanji.dingtalk.com' in pg.url:
-                            link_url = pg.url.replace('/permission/', '/transcribes/')
-                            await pg.close()
-                            break
-
-                        # 情况2: 打开了错误页面（假链接/备注文字）
-                        # 检查是否是错误页面
-                        try:
-                            page_content = await pg.content()
-                            # 如果是Chrome错误页面或空白页
-                            if ('ERR_' in pg.url or 'chrome-error://' in pg.url or
-                                'about:blank' in pg.url or
-                                '无法访问' in page_content or 'ERR_CONNECTION' in page_content):
-                                await pg.close()
-                                return "无", None  # 这是假链接，归为"无链接"
-                        except:
-                            pass
-
-                        # 如果是其他未知页面，也关闭
-                        await pg.close()
+                            try:
+                                page_content = await pg.content()
+                                if (
+                                    'ERR_' in pg.url
+                                    or 'chrome-error://' in pg.url
+                                    or 'about:blank' in pg.url
+                                    or '无法访问' in page_content
+                                    or 'ERR_CONNECTION' in page_content
+                                ):
+                                    await pg.close()
+                                else:
+                                    await pg.close()
+                            except Exception:
+                                pass
+                    if content_page:
                         break
 
-                if link_url or new_page:
+                    if page.url != initial_page_urls.get(page, page.url):
+                        if await page_looks_like_transcribe(page):
+                            content_page = page
+                            break
+
+                if content_page:
+                    link_url = content_page.url or candidate.get('href') or None
                     break
 
-            if not link_url:
-                return "无", None
-
+            if not content_page:
+                return "无", None, []
         except Exception as e:
-            return "无", None
-        
-        # 访问链接并提取内容
-        context = page.context
-        content_page = await context.new_page()
-        
+            return "无", None, []
+
         try:
-            await content_page.goto(link_url, wait_until='domcontentloaded', timeout=60000)
-            # 增加初始等待时间，给权限验证更多时间
+            normalized_link_url = link_url.replace('/permission/', '/transcribes/') if link_url else None
+            if normalized_link_url and normalized_link_url != content_page.url:
+                await content_page.goto(normalized_link_url, wait_until='domcontentloaded', timeout=60000)
+                link_url = normalized_link_url
+
+            # 增加初始等待时间，给权限验证和页面挂载更多时间
             await content_page.wait_for_timeout(8000)
 
             # 检查权限
@@ -405,7 +692,7 @@ async def extract_content_for_current_sheet(page, target_date):
                 # 重试后还是无权限，才返回"无权限"
                 if '暂无权限' in page_text or '申请权限' in page_text:
                     await content_page.close()
-                    return "无权限", link_url
+                    return "无权限", link_url, []
                 else:
                     print(f"  ✓ 权限验证通过（重试成功）")
 
@@ -416,14 +703,36 @@ async def extract_content_for_current_sheet(page, target_date):
             try:
                 clicked = await content_page.evaluate('''
                     () => {
-                        // 查找"转写"标签页按钮
-                        const tabs = document.querySelectorAll('.dtd-tabs-tab');
-                        for (const tab of tabs) {
-                            const btn = tab.querySelector('.dtd-tabs-tab-btn');
-                            if (btn && btn.innerText.trim() === '转写') {
-                                btn.click();
-                                return true;
+                        const candidates = [];
+                        const selectors = [
+                            '.dtd-tabs-tab',
+                            '.dtd-tabs-tab-btn',
+                            '[role="tab"]',
+                            'button',
+                            '[class*="tab"]'
+                        ];
+
+                        for (const selector of selectors) {
+                            document.querySelectorAll(selector).forEach(elem => candidates.push(elem));
+                        }
+
+                        const seen = new Set();
+                        for (const elem of candidates) {
+                            if (!elem || seen.has(elem)) {
+                                continue;
                             }
+                            seen.add(elem);
+
+                            const text = (elem.innerText || elem.textContent || '').trim();
+                            if (!text || !text.includes('转写')) {
+                                continue;
+                            }
+
+                            elem.click();
+                            if (typeof elem.dispatchEvent === 'function') {
+                                elem.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                            }
+                            return true;
                         }
                         return false;
                     }
@@ -438,6 +747,9 @@ async def extract_content_for_current_sheet(page, target_date):
             except Exception as e:
                 print(f"  ⚠️ 切换标签页失败: {e}")
 
+            raw_page_text = await content_page.evaluate('() => document.body.innerText')
+            timed_transcription = build_transcription_from_timed_segments(raw_page_text)
+
             # 提取内容（只提取转写标签页的内容）
             content = await content_page.evaluate('''
                 () => {
@@ -445,7 +757,9 @@ async def extract_content_for_current_sheet(page, target_date):
                     const transcribeSelectors = [
                         '.fm-transcribe-text__list',
                         '.fm-transcribe-text__auto-sizer',
-                        '.fm-transcribe-text'
+                        '.fm-transcribe-text',
+                        '[class*="transcribe"]',
+                        '[class*="speech"]'
                     ];
 
                     for (const selector of transcribeSelectors) {
@@ -464,6 +778,35 @@ async def extract_content_for_current_sheet(page, target_date):
                                 return text;
                             }
                         }
+                    }
+
+                    // 再降级：优先寻找包含多段时间戳的最小内容块
+                    const blocks = Array.from(document.querySelectorAll('div, section, article, main'));
+                    const transcriptCandidates = [];
+                    for (const block of blocks) {
+                        const text = (block.innerText || '').trim();
+                        if (text.length < 100) {
+                            continue;
+                        }
+                        const timestampCount = (text.match(/\b\d{2}:\d{2}(?::\d{2})?\b/g) || []).length;
+                        if (timestampCount < 2) {
+                            continue;
+                        }
+                        transcriptCandidates.push({
+                            text,
+                            timestampCount,
+                            length: text.length,
+                        });
+                    }
+
+                    if (transcriptCandidates.length > 0) {
+                        transcriptCandidates.sort((a, b) => {
+                            if (a.timestampCount !== b.timestampCount) {
+                                return b.timestampCount - a.timestampCount;
+                            }
+                            return a.length - b.length;
+                        });
+                        return transcriptCandidates[0].text;
                     }
 
                     // 降级方案：移除导航元素后提取
@@ -490,6 +833,14 @@ async def extract_content_for_current_sheet(page, target_date):
                 }
             ''')
             
+            discipline_alerts = extract_speech_discipline_alerts(raw_page_text or content)
+
+            used_timed_transcription = False
+            if timed_transcription:
+                content = timed_transcription
+                used_timed_transcription = True
+                print(f"  ✓ 通过时间轴提取到语音转写（{len(content)} 字符）")
+
             # 清理内容
             if content:
                 lines = content.split('\n')
@@ -520,11 +871,12 @@ async def extract_content_for_current_sheet(page, target_date):
                 
                 content = '\n'.join(cleaned_lines)
             
-            await content_page.close()
+            if content_page != page:
+                await content_page.close()
             
             if content and len(content) > 50:
                 # 提取语音转写内容（完整的会议转写，而不是AI纪要）
-                transcription = None
+                transcription = content if used_timed_transcription else None
 
                 # 钉钉 AI 听记的格式通常是：
                 # AI 纪要（这部分我们不要）
@@ -566,16 +918,17 @@ async def extract_content_for_current_sheet(page, target_date):
                     transcription = content
                     print(f"  ⚠ 使用完整内容作为语音转写（{len(transcription)} 字符）")
 
-                return transcription, link_url
+                return transcription, link_url, discipline_alerts
             else:
-                return "无", link_url
+                return "无", link_url, discipline_alerts
             
         except Exception as e:
-            await content_page.close()
-            return f"访问出错: {str(e)[:100]}", link_url
+            if content_page != page:
+                await content_page.close()
+            return f"访问出错: {str(e)[:100]}", link_url, []
     
     except Exception as e:
-        return f"提取出错: {str(e)[:100]}", None
+        return f"提取出错: {str(e)[:100]}", None, []
 
 def analyze_with_ai(results, target_date):
     """使用AI分析会议内容"""
@@ -594,9 +947,6 @@ def analyze_with_ai(results, target_date):
         return "\n\n📊 AI分析：今日无可分析内容（所有单元均无权限或无链接）\n"
 
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
-
         # 构建分析提示词
         content_summary = f"# {target_date} 业务单元早会语音转写内容\n\n"
         for r in success_results:
@@ -792,12 +1142,12 @@ def analyze_with_ai(results, target_date):
 """
 
         print("  正在进行AI分析...")
-        response = model.generate_content(prompt)
+        analysis_text = generate_text(prompt, "gemini-2.5-flash", api_key=api_key)
 
         analysis = "\n\n" + "="*80 + "\n"
         analysis += "早会质量评估报告\n"
         analysis += "="*80 + "\n\n"
-        analysis += response.text
+        analysis += analysis_text
         analysis += "\n\n" + "="*80 + "\n"
         analysis += "💡 报告由 DingCheck + Google Gemini AI 生成\n"
         analysis += f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -812,7 +1162,14 @@ async def batch_check_auto(target_date):
     """全自动批量检查"""
     async with async_playwright() as p:
         try:
-            browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+            print("连接 Chrome 调试会话...")
+            browser, browser_info = await connect_browser_over_cdp(p)
+            print(
+                f"✓ Chrome CDP 已连接: {browser_info['browser']} "
+                f"(Protocol {browser_info['protocol_version']})"
+            )
+            if not browser.contexts:
+                raise RuntimeError("Chrome CDP 已连接，但未发现可用浏览器上下文")
             context = browser.contexts[0]
 
             # 查找主页面（优先选择有applicationId但没有sheetId的页面）
@@ -858,14 +1215,15 @@ async def batch_check_auto(target_date):
                         'group': UNIT_GROUPS.get(sheet_name, "未分组"),
                         'status': '无法访问',
                         'content': None,
-                        'link': None
+                        'link': None,
+                        'discipline_alerts': []
                     })
                     continue
 
                 print(f"  ✓ 已切换到工作表")
 
                 # 提取内容
-                content, link = await extract_content_for_current_sheet(page, target_date)
+                content, link, discipline_alerts = await extract_content_for_current_sheet(page, target_date)
 
                 if content == "无":
                     print(f"  结果: 无听记链接")
@@ -874,7 +1232,8 @@ async def batch_check_auto(target_date):
                         'group': UNIT_GROUPS.get(sheet_name, "未分组"),
                         'status': '无',
                         'content': None,
-                        'link': None
+                        'link': None,
+                        'discipline_alerts': []
                     })
                 elif content == "无表格":
                     print(f"  结果: 无表格数据")
@@ -883,7 +1242,8 @@ async def batch_check_auto(target_date):
                         'group': UNIT_GROUPS.get(sheet_name, "未分组"),
                         'status': '无表格',
                         'content': None,
-                        'link': None
+                        'link': None,
+                        'discipline_alerts': []
                     })
                 elif content == "无权限":
                     print(f"  结果: 无权限")
@@ -892,7 +1252,8 @@ async def batch_check_auto(target_date):
                         'group': UNIT_GROUPS.get(sheet_name, "未分组"),
                         'status': '无权限',
                         'content': None,
-                        'link': link
+                        'link': link,
+                        'discipline_alerts': []
                     })
                 elif content.startswith("访问出错") or content.startswith("提取出错"):
                     print(f"  结果: {content[:50]}...")
@@ -901,16 +1262,20 @@ async def batch_check_auto(target_date):
                         'group': UNIT_GROUPS.get(sheet_name, "未分组"),
                         'status': '错误',
                         'content': content,
-                        'link': link
+                        'link': link,
+                        'discipline_alerts': []
                     })
                 else:
                     print(f"  结果: 成功提取（{len(content)} 字符）")
+                    if discipline_alerts:
+                        print(f"  ⚠️ 会议纪律提醒：检测到 {len(discipline_alerts)} 段单人发言超过2分钟")
                     results.append({
                         'sheet': sheet_name,
                         'group': UNIT_GROUPS.get(sheet_name, "未分组"),
                         'status': '成功',
                         'content': content,
-                        'link': link
+                        'link': link,
+                        'discipline_alerts': discipline_alerts
                     })
 
                 # 返回主页面
@@ -976,85 +1341,35 @@ async def batch_check_auto(target_date):
                     if r['status'] == '无权限':
                         print(f"  - {r['sheet']}: {r['link']}")
 
-            # 保存报告到文件
-            import os
-            from collections import defaultdict
-            report_dir = os.path.expanduser("~/repos/dingcheck/data/daily_reports")
+            # 保存结构化报告与兼容文本报告
+            report_dir = os.path.join(PROJECT_ROOT, "data", "daily_reports")
             os.makedirs(report_dir, exist_ok=True)
-            report_file = os.path.join(report_dir, f"report_{target_date}.txt")
-            with open(report_file, 'w', encoding='utf-8') as f:
-                f.write(f"钉钉日会检查报告\n")
-                f.write(f"="*80 + "\n")
-                f.write(f"日期: {target_date}\n")
-                f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("="*80 + "\n\n")
+            generate_dt = datetime.now()
+            generate_time = generate_dt.strftime('%Y-%m-%d %H:%M:%S')
+            run_id = generate_dt.strftime('%Y%m%d-%H%M%S-%f')
+            ai_analysis = analyze_with_ai(results, target_date)
+            report_data = build_report_data(target_date, generate_time, results, ai_analysis, run_id=run_id)
 
-                f.write(f"总体统计:\n")
-                f.write(f"  总计: {total} 个业务单元\n")
-                f.write(f"  ✓ 成功提取: {success_count}\n")
-                f.write(f"  - 无听记链接: {no_link_count}\n")
-                f.write(f"  - 无表格数据: {no_table_count}\n")
-                f.write(f"  ⚠ 无权限: {no_permission_count}\n")
-                f.write(f"  ✗ 错误/无法访问: {error_count}\n\n")
+            latest_json_file = os.path.join(report_dir, f"report_{target_date}.json")
+            archive_json_file = os.path.join(report_dir, f"report_{target_date}__{run_id}.json")
 
-                # 按分组统计
-                f.write("="*80 + "\n")
-                f.write("分组统计\n")
-                f.write("="*80 + "\n\n")
+            with open(archive_json_file, 'w', encoding='utf-8') as f:
+                json.dump(report_data, f, ensure_ascii=False, indent=2)
+            shutil.copyfile(archive_json_file, latest_json_file)
 
-                groups_stats = defaultdict(lambda: {'total': 0, 'success': 0, 'no_link': 0, 'no_permission': 0, 'error': 0})
-                for r in results:
-                    group = r['group']
-                    groups_stats[group]['total'] += 1
-                    if r['status'] == '成功':
-                        groups_stats[group]['success'] += 1
-                    elif r['status'] == '无':
-                        groups_stats[group]['no_link'] += 1
-                    elif r['status'] == '无权限':
-                        groups_stats[group]['no_permission'] += 1
-                    elif r['status'] in ['错误', '无法访问', '无表格']:
-                        groups_stats[group]['error'] += 1
+            report_file = None
+            if should_generate_txt_report():
+                archive_report_file = os.path.join(report_dir, f"report_{target_date}__{run_id}.txt")
+                latest_report_file = os.path.join(report_dir, f"report_{target_date}.txt")
+                with open(archive_report_file, 'w', encoding='utf-8') as f:
+                    f.write(render_text_report(report_data))
+                shutil.copyfile(archive_report_file, latest_report_file)
+                report_file = latest_report_file
 
-                # 按配置文件顺序显示分组统计
-                displayed_groups = []
-                for r in results:
-                    if r['group'] not in displayed_groups:
-                        displayed_groups.append(r['group'])
-
-                for group_name in displayed_groups:
-                    stats = groups_stats[group_name]
-                    f.write(f"【{group_name}】\n")
-                    f.write(f"  总计: {stats['total']} | 成功: {stats['success']} | 无链接: {stats['no_link']} | 无权限: {stats['no_permission']} | 错误: {stats['error']}\n\n")
-
-                # 详细内容 - 按分组展示
-                f.write("\n" + "="*80 + "\n")
-                f.write("详细内容\n")
-                f.write("="*80 + "\n\n")
-
-                for group_name in displayed_groups:
-                    f.write(f"\n{'='*80}\n")
-                    f.write(f"【{group_name}】\n")
-                    f.write(f"{'='*80}\n\n")
-
-                    # 找出该分组的所有单元
-                    group_results = [r for r in results if r['group'] == group_name]
-
-                    for r in group_results:
-                        f.write(f"\n{'-'*80}\n")
-                        f.write(f"▸ {r['sheet']}\n")
-                        f.write(f"{'-'*80}\n")
-                        f.write(f"状态: {r['status']}\n")
-                        if r['link']:
-                            f.write(f"链接: {r['link']}\n")
-                        # 不再输出转写内容，只保留评分和分析
-                        # if r['content'] and r['status'] == '成功':
-                        #     f.write(f"\n内容:\n{r['content']}\n")
-
-                # 进行AI分析并追加到报告
-                ai_analysis = analyze_with_ai(results, target_date)
-                f.write(ai_analysis)
-
-            print(f"\n报告已保存到: {report_file}")
+            print(f"结构化数据已保存到: {latest_json_file}")
+            print(f"历史归档JSON已保存到: {archive_json_file}")
+            if report_file:
+                print(f"兼容文本报告已保存到: {report_file}")
 
             # 显示AI分析结果
             if success_count > 0:
@@ -1076,4 +1391,3 @@ if __name__ == "__main__":
         target_date = sys.argv[1]
 
     asyncio.run(batch_check_auto(target_date))
-

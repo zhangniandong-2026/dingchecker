@@ -1,90 +1,41 @@
-# 钉钉早会检查器项目
+# 文档索引
 
-自动检查钉钉文档中各业务单元的AI听记链接，提取会议内容，并进行AI智能分析。
+本目录存放 DingChecker 的使用说明、环境配置和历史改造记录。
 
-## 📁 目录结构
+当前仓库的默认主链已经是：
 
-```
-dingtalk_checker/
-├── scripts/              # 主要脚本
-│   ├── daily_check.py   # 核心脚本：每日自动检查
-│   ├── run_daily_check.sh
-│   ├── start_chrome_debug.sh
-│   └── 其他辅助脚本
-│
-├── tests/               # 测试脚本
-│   ├── test_single.py  # 测试单个业务单元
-│   ├── test_single_verbose.py  # 详细测试
-│   └── 其他测试文件
-│
-├── docs/                # 文档
-│   ├── AI_ANALYSIS_SETUP.md  # AI分析功能配置
-│   ├── README_使用说明.md
-│   ├── 项目完整指南.md
-│   └── 定时任务安装说明.md
-│
-├── daily_reports/       # 每日生成的报告
-│   ├── report_2026-03-02.txt
-│   └── ...
-│
-├── chrome/              # Chrome调试相关
-│   ├── chrome_debug_profile/
-│   └── chrome_persistent_profile/
-│
-├── logs/                # 日志文件
-│
-├── archives/            # 废弃的旧脚本
-│
-├── .venv/               # Python虚拟环境
-│
-└── links_config.txt     # 配置文件
+`DingTalk / AI 听记 -> 结构化 JSON -> HTML 报告`
 
-```
+因此阅读文档时，建议优先关注和 `JSON / HTML / Chrome CDP / google-genai` 相关的内容。
 
-## 🚀 快速开始
+## 推荐优先阅读
 
-### 1. 启动Chrome调试模式
-```bash
-cd ~/dingtalk_checker
-./chrome/start_chrome_debug.sh
-```
+- [使用指南](/Users/zhangniandong/repos/dingchecker/docs/使用指南.md)
+- [AI_ANALYSIS_SETUP.md](/Users/zhangniandong/repos/dingchecker/docs/AI_ANALYSIS_SETUP.md)
+- [代理配置说明.md](/Users/zhangniandong/repos/dingchecker/docs/代理配置说明.md)
+- [MEETING_STANDARDS_3PLUS1.md](/Users/zhangniandong/repos/dingchecker/docs/MEETING_STANDARDS_3PLUS1.md)
 
-### 2. 运行每日检查
-```bash
-cd ~/dingtalk_checker
-source .venv/bin/activate
-python3 scripts/daily_check.py
-```
+## 和当前版本强相关的主题
 
-### 3. 测试单个业务单元
-```bash
-cd ~/dingtalk_checker
-source .venv/bin/activate
-python3 tests/test_single.py "业务单元名称" "2026-03-02"
-```
+- 晨会评估标准与“3+1”模板
+- Gemini / Google Gen AI SDK 配置
+- Chrome 远程调试与钉钉登录态复用
+- HTML 报告与结构化 JSON 输出
 
-## ⚙️ 配置
+## 说明
 
-### API密钥配置
-```bash
-export GEMINI_API_KEY='your-api-key'
-```
+本目录中部分文档保留了历史改造记录和阶段性方案，用于追溯问题背景。
 
-### 自动任务
-每天上午10:00自动运行，配置文件在：
-`~/Library/LaunchAgents/com.dingtalk.dailycheck.plist`
+如果你只想快速了解“现在怎么跑”，优先看：
 
-## 📊 查看报告
+1. 根目录 [README.md](/Users/zhangniandong/repos/dingchecker/README.md)
+2. [skill/README_GITHUB.md](/Users/zhangniandong/repos/dingchecker/skill/README_GITHUB.md)
+3. [使用指南](/Users/zhangniandong/repos/dingchecker/docs/使用指南.md)
 
-```bash
-cd ~/dingtalk_checker
-cat daily_reports/report_2026-03-02.txt
-```
+## 当前已知边界
 
-## 📚 详细文档
-
-请查看 `docs/` 目录下的文档文件。
-
----
-
-**注意**：此项目依赖Chrome远程调试模式，使用前需要先启动Chrome。
+- 依赖 Chrome CDP 和已登录钉钉会话
+- 推荐 Python `3.10+`
+- 默认产物是 `HTML + JSON`
+- `TXT / PDF` 已降级为兼容产物
+- “单人发言超过 2 分钟”提醒能力已接入，但依赖转写页时间轴可提取性

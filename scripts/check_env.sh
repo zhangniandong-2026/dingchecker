@@ -16,6 +16,29 @@ success=0
 warnings=0
 errors=0
 
+# 检查 Python 版本
+echo "0. 检查 Python 版本..."
+python_version=$(python3 - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)
+
+if python3 - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+then
+    echo -e "   ${GREEN}✓${NC} Python ${python_version}（推荐范围）"
+    ((success++))
+else
+    echo -e "   ${YELLOW}⚠${NC} Python ${python_version}（建议升级到 3.10+）"
+    echo "      原因: google-genai 相关依赖对 Python 3.9 只提供弱支持"
+    ((warnings++))
+fi
+
+echo ""
+
 # 检查Python虚拟环境
 echo "1. 检查 Python 虚拟环境..."
 if [ -d ~/.venv ]; then

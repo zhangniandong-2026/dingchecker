@@ -7,11 +7,7 @@ import os
 from playwright.async_api import async_playwright
 from datetime import datetime, date
 
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
+from gemini_sdk import GEMINI_AVAILABLE, generate_text
 
 async def discover_current_page(page):
     """识别当前打开的钉钉页面"""
@@ -204,9 +200,6 @@ async def analyze_with_gemini(all_content):
             print("⚠️  未配置 GEMINI_API_KEY")
             return None
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-
         # 构建提示词
         prompt = f"""
 请分析以下业务会议内容，提供专业的管理分析报告：
@@ -232,8 +225,7 @@ async def analyze_with_gemini(all_content):
    - 组织级优化方向
 """
 
-        response = model.generate_content(prompt)
-        analysis = response.text
+        analysis = generate_text(prompt, 'gemini-2.0-flash-exp', api_key=api_key)
 
         print("✓ AI 分析完成")
         return analysis

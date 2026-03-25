@@ -1,3 +1,9 @@
+import os
+from datetime import datetime
+
+from gemini_sdk import GEMINI_AVAILABLE, generate_text
+
+
 def analyze_with_ai(results, target_date):
     """使用AI分析会议内容 - 优化版，输出新格式报告"""
     if not GEMINI_AVAILABLE:
@@ -15,9 +21,6 @@ def analyze_with_ai(results, target_date):
         return "\n\n📊 AI分析：今日无可分析内容（所有单元均无权限或无链接）\n"
 
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
-
         # 构建分析提示词
         content_summary = f"# {target_date} 业务单元早会语音转写内容\n\n"
         for r in success_results:
@@ -225,13 +228,13 @@ def analyze_with_ai(results, target_date):
 """
 
         print("  正在进行AI分析...")
-        response = model.generate_content(prompt)
+        analysis_text = generate_text(prompt, "gemini-2.5-flash", api_key=api_key)
 
         # 组装最终报告
         analysis = "\n\n" + "="*80 + "\n"
         analysis += "早会质量评估报告\n"
         analysis += "="*80 + "\n\n"
-        analysis += response.text
+        analysis += analysis_text
         analysis += "\n\n" + "="*80 + "\n"
         analysis += "💡 报告由 DingCheck + Google Gemini AI 生成\n"
         analysis += f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"

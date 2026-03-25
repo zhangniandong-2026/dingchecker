@@ -108,7 +108,7 @@ AI 智能分析
 **解决**：
 ```bash
 source .venv/bin/activate
-pip install google-generativeai
+pip install google-genai
 ```
 
 ### 问题3：API调用失败
@@ -120,7 +120,7 @@ pip install google-generativeai
 **检查方法**：
 ```bash
 # 测试API连接
-python3 -c "import google.generativeai as genai; genai.configure(api_key='your-key'); print('OK')"
+python3 -c "from google import genai; client = genai.Client(api_key='your-key'); print('OK'); client.close()"
 ```
 
 ## 📝 未来可扩展功能

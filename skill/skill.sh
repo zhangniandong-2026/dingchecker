@@ -15,12 +15,15 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Project paths
-PROJECT_ROOT="$HOME/repos/dingcheck"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 REPORTS_DIR="$PROJECT_ROOT/data/daily_reports"
 CONFIG_DIR="$PROJECT_ROOT/config"
 CONFIG_FILE="$CONFIG_DIR/business_units.txt"
 CHROME_SCRIPT="$PROJECT_ROOT/chrome/start_chrome_debug.sh"
+CDP_PORT="${DINGCHECK_CDP_PORT:-9222}"
+CDP_HOST="${DINGCHECK_CDP_HOST:-127.0.0.1}"
 
 # Skill config paths
 SKILL_DIR="$PROJECT_ROOT/skill"
@@ -113,17 +116,38 @@ print_error() {
     echo -e "${RED}$1${NC}"
 }
 
+check_python_runtime() {
+    local py_info
+    py_info=$(python3 - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)
+
+    if python3 - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+    then
+        print_success "✓ Python版本: ${py_info}（推荐范围）"
+    else
+        print_warning "⚠️  Python版本: ${py_info}（建议升级到 3.10+，当前 Google SDK 对 3.9 仅弱支持）"
+    fi
+}
+
 #############################################
 # Chrome Management
 #############################################
 
 ensure_chrome_debug() {
-    if ! pgrep -f "remote-debugging-port=9222" > /dev/null; then
+    if ! pgrep -f "remote-debugging-port=${CDP_PORT}" > /dev/null; then
         print_info "🚀 启动Chrome调试模式..."
-        bash "$CHROME_SCRIPT" &
-        sleep 5
+        if ! bash "$CHROME_SCRIPT" --port "$CDP_PORT"; then
+            print_error "❌ Chrome启动失败"
+            exit 1
+        fi
 
-        if ! pgrep -f "remote-debugging-port=9222" > /dev/null; then
+        if ! pgrep -f "remote-debugging-port=${CDP_PORT}" > /dev/null; then
             print_error "❌ Chrome启动失败"
             exit 1
         fi
@@ -143,7 +167,7 @@ from playwright.async_api import async_playwright
 async def open_url():
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+            browser = await p.chromium.connect_over_cdp("http://$CDP_HOST:$CDP_PORT")
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else await context.new_page()
             await page.goto("$DINGTALK_URL", wait_until='domcontentloaded', timeout=60000)
@@ -169,6 +193,7 @@ EOF
 select_units_interactive() {
     # 临时禁用unbound variable检查，因为中文字符串在某些bash版本中有问题
     set +u
+    local selected_scope_label=""
 
     print_info "🔍 选择要检查的业务单元" >&2
     echo "" >&2
@@ -288,6 +313,7 @@ select_units_interactive() {
             local theater_idx=$((selection - 2))
             if [[ $theater_idx -ge 0 ]] && [[ $theater_idx -lt ${#THEATERS[@]} ]]; then
                 selected_units="${THEATERS[$theater_idx]}"
+                selected_scope_label="${THEATER_NAMES[$theater_idx]}"
             else
                 print_error "❌ 无效选项" >&2
                 set -u
@@ -303,7 +329,7 @@ select_units_interactive() {
     set -u
 
     # 只输出选择结果到stdout
-    echo "$selected_units"
+    printf '%s\t%s\n' "$selected_units" "$selected_scope_label"
 }
 
 #############################################
@@ -313,6 +339,7 @@ select_units_interactive() {
 run_daily_check() {
     local date="$1"
     local selected_units="$2"
+    local report_scope_label="${3:-}"
 
     print_info "🚀 开始检查..."
     print_info "📅 日期: $date"
@@ -378,7 +405,7 @@ run_daily_check() {
 
     # 运行检查
     print_info "🔄 正在提取数据..."
-    if ! python3 "$SCRIPTS_DIR/daily_check.py" "$date"; then
+    if ! DINGCHECK_REPORT_SCOPE_LABEL="$report_scope_label" python3 -u "$SCRIPTS_DIR/daily_check.py" "$date"; then
         print_error "❌ 检查过程出错，请查看日志"
         cleanup_config
         trap - EXIT INT TERM
@@ -391,35 +418,96 @@ run_daily_check() {
 
     echo ""
 
-    # 生成PDF和HTML报告
     local report_file="$REPORTS_DIR/report_${date}.txt"
+    local json_file="$REPORTS_DIR/report_${date}.json"
     local pdf_file="$REPORTS_DIR/report_${date}.pdf"
     local html_file="$REPORTS_DIR/report_${date}.html"
+    local archive_report_file="$report_file"
+    local archive_json_file="$json_file"
+    local archive_pdf_file="$pdf_file"
+    local archive_html_file="$html_file"
+    local current_run_id=""
 
-    if [ -f "$report_file" ]; then
+    if [ -f "$json_file" ]; then
+        current_run_id=$(get_json_report_run_id "$json_file")
+        if [ -n "$current_run_id" ]; then
+            local candidate_json="$REPORTS_DIR/report_${date}__${current_run_id}.json"
+            local candidate_txt="$REPORTS_DIR/report_${date}__${current_run_id}.txt"
+            local candidate_pdf="$REPORTS_DIR/report_${date}__${current_run_id}.pdf"
+            local candidate_html="$REPORTS_DIR/report_${date}__${current_run_id}.html"
+
+            if [ -f "$candidate_json" ]; then
+                archive_json_file="$candidate_json"
+            fi
+            archive_report_file="$candidate_txt"
+            archive_pdf_file="$candidate_pdf"
+            archive_html_file="$candidate_html"
+        fi
+    fi
+
+    local html_source=""
+    if [ -f "$archive_json_file" ]; then
+        html_source="$archive_json_file"
+    elif [ -f "$json_file" ]; then
+        html_source="$json_file"
+    elif [ -f "$archive_report_file" ]; then
+        html_source="$archive_report_file"
+    elif [ -f "$report_file" ]; then
+        html_source="$report_file"
+    fi
+
+    if [ -n "$html_source" ]; then
         print_info "📊 正在生成可视化报告..."
 
-        # 生成PDF
-        if python3 "$SCRIPTS_DIR/generate_pdf_report.py" "$report_file" "$pdf_file" 2>/dev/null; then
-            print_success "✓ PDF报告生成成功"
-        else
-            print_warning "⚠️  PDF生成失败（文本报告仍可用）"
+        local html_output_file="$html_file"
+        if [ -n "$current_run_id" ]; then
+            html_output_file="$archive_html_file"
         fi
 
-        # 生成HTML
-        if python3 "$SCRIPTS_DIR/generate_html_report.py" "$report_file" "$html_file" 2>/dev/null; then
+        if python3 "$SCRIPTS_DIR/generate_html_report.py" "$html_source" "$html_output_file" 2>/dev/null; then
+            if [ "$html_output_file" != "$html_file" ]; then
+                cp "$html_output_file" "$html_file"
+            fi
             print_success "✓ HTML可视化报告生成成功"
         else
-            print_warning "⚠️  HTML生成失败（文本报告仍可用）"
+            print_warning "⚠️  HTML生成失败（结构化数据/文本报告仍可用）"
+        fi
+
+        if [ "${DINGCHECK_GENERATE_PDF:-0}" = "1" ]; then
+            local pdf_source="$report_file"
+            local pdf_output_file="$pdf_file"
+            if [ -f "$archive_report_file" ]; then
+                pdf_source="$archive_report_file"
+            fi
+            if [ -n "$current_run_id" ]; then
+                pdf_output_file="$archive_pdf_file"
+            fi
+
+            if [ -f "$pdf_source" ] && python3 "$SCRIPTS_DIR/generate_pdf_report.py" "$pdf_source" "$pdf_output_file" 2>/dev/null; then
+                if [ "$pdf_output_file" != "$pdf_file" ]; then
+                    cp "$pdf_output_file" "$pdf_file"
+                fi
+                print_success "✓ PDF兼容报告生成成功"
+            else
+                print_warning "⚠️  PDF兼容报告生成失败"
+            fi
         fi
     fi
 
     # 显示结果
     echo ""
-    if [ -f "$report_file" ]; then
+    local txt_expected=0
+    local pdf_expected=0
+    if [ "${DINGCHECK_GENERATE_TXT:-0}" = "1" ] || [ "${DINGCHECK_GENERATE_PDF:-0}" = "1" ]; then
+        txt_expected=1
+    fi
+    if [ "${DINGCHECK_GENERATE_PDF:-0}" = "1" ]; then
+        pdf_expected=1
+    fi
+
+    if [ -f "$html_file" ] || [ -f "$json_file" ] || [ -f "$report_file" ]; then
         print_success "✅ 检查完成！"
         echo ""
-        print_info "📄 文本报告: $report_file"
 
         if [ -f "$html_file" ]; then
             print_info "🌐 HTML可视化报告: $html_file"
@@ -427,15 +515,35 @@ run_daily_check() {
             open "$html_file"
         fi
 
-        if [ -f "$pdf_file" ]; then
-            print_info "📊 PDF报告: $pdf_file"
+        if [ -f "$json_file" ]; then
+            print_info "🧩 JSON结构化报告: $json_file"
         fi
 
-        echo ""
-        print_info "📊 检查摘要:"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        head -20 "$report_file"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if [ "$txt_expected" = "1" ] && [ -f "$report_file" ]; then
+            print_info "📄 文本兼容报告: $report_file"
+        else
+            print_info "📄 文本兼容报告: 默认未生成（如需启用可设置 DINGCHECK_GENERATE_TXT=1）"
+        fi
+
+        if [ "$pdf_expected" = "1" ] && [ -f "$pdf_file" ]; then
+            print_info "📊 PDF兼容报告: $pdf_file"
+        else
+            print_info "📊 PDF兼容报告: 默认未生成（如需启用可设置 DINGCHECK_GENERATE_PDF=1）"
+        fi
+
+        if [ -f "$json_file" ]; then
+            echo ""
+            print_info "📊 检查摘要:"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            show_json_report_summary "$json_file"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        elif [ -f "$report_file" ]; then
+            echo ""
+            print_info "📊 检查摘要:"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            head -20 "$report_file"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        fi
     else
         print_warning "⚠️  未找到 $date 的数据"
         echo ""
@@ -451,6 +559,191 @@ run_daily_check() {
 #############################################
 # View/Search/List Functions
 #############################################
+
+show_json_report_summary() {
+    local json_file="$1"
+
+    python3 - "$json_file" <<'PY'
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1]).resolve().parents[2]
+sys.path.insert(0, str(repo_root / "scripts"))
+
+from report_data import load_report_data
+
+report = load_report_data(sys.argv[1])
+metadata = report.get("metadata", {})
+summary = report.get("summary", {})
+units = report.get("analysis", {}).get("units", [])
+
+print(f"标题: {metadata.get('title', '早会质量评估报告')}")
+print(f"日期: {metadata.get('report_date', '')}")
+print(f"生成时间: {metadata.get('generated_at', '')}")
+if metadata.get("run_id"):
+    print(f"运行ID: {metadata.get('run_id')}")
+print("")
+print("总体统计:")
+print(f"  总计: {summary.get('total_units', 0)} 个业务单元")
+print(f"  成功提取: {summary.get('success_count', 0)}")
+print(f"  无听记链接: {summary.get('no_link_count', 0)}")
+print(f"  无权限: {summary.get('no_permission_count', 0)}")
+print(f"  错误/无法访问: {summary.get('error_count', 0)}")
+
+if units:
+    print("")
+    print("TOP 排名:")
+    for unit in units[:5]:
+        print(f"  #{unit.get('rank', '-')} {unit.get('name', '')} - {unit.get('total', 0)}/{unit.get('max_total', 25)} ({unit.get('percentage', 0)}%)")
+PY
+}
+
+get_json_report_title() {
+    local json_file="$1"
+
+    python3 - "$json_file" <<'PY'
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1]).resolve().parents[2]
+sys.path.insert(0, str(repo_root / "scripts"))
+
+from report_data import load_report_data
+
+report = load_report_data(sys.argv[1])
+print(report.get("metadata", {}).get("title", "早会质量评估报告"))
+PY
+}
+
+get_json_report_run_id() {
+    local json_file="$1"
+
+    python3 - "$json_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+print(report.get("metadata", {}).get("run_id", ""))
+PY
+}
+
+list_report_dates() {
+    python3 - "$REPORTS_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+report_dir = Path(sys.argv[1])
+dates = set()
+pattern = re.compile(r"^report_(\d{4}-\d{2}-\d{2})(?:__.+)?\.(?:html|json|txt|pdf)$")
+
+if report_dir.exists():
+    for path in report_dir.iterdir():
+        match = pattern.match(path.name)
+        if match:
+            dates.add(match.group(1))
+
+for date in sorted(dates, reverse=True):
+    print(date)
+PY
+}
+
+get_report_run_count() {
+    local date="$1"
+
+    python3 - "$REPORTS_DIR" "$date" <<'PY'
+import sys
+from pathlib import Path
+
+report_dir = Path(sys.argv[1])
+date = sys.argv[2]
+archive_jsons = sorted(report_dir.glob(f"report_{date}__*.json"))
+
+if archive_jsons:
+    print(len(archive_jsons))
+elif any((report_dir / f"report_{date}.{ext}").exists() for ext in ("json", "html", "txt", "pdf")):
+    print(1)
+else:
+    print(0)
+PY
+}
+
+list_search_targets() {
+    python3 - "$REPORTS_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+report_dir = Path(sys.argv[1])
+dates = set()
+
+for pattern in ("report_*.json", "report_*.txt"):
+    for path in report_dir.glob(pattern):
+        stem = path.stem[len("report_"):]
+        date = stem.split("__", 1)[0]
+        if len(date) == 10:
+            dates.add(date)
+
+for date in sorted(dates, reverse=True):
+    archive_jsons = sorted(report_dir.glob(f"report_{date}__*.json"), reverse=True)
+    if archive_jsons:
+        for path in archive_jsons:
+            print(f"{date}\tjson\t{path}")
+        continue
+
+    latest_json = report_dir / f"report_{date}.json"
+    latest_txt = report_dir / f"report_{date}.txt"
+    if latest_json.exists():
+        print(f"{date}\tjson\t{latest_json}")
+    elif latest_txt.exists():
+        print(f"{date}\ttxt\t{latest_txt}")
+PY
+}
+
+search_json_report() {
+    local json_file="$1"
+    local keyword="$2"
+
+    python3 - "$json_file" "$keyword" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+keyword = sys.argv[2].casefold()
+matches = []
+
+def add_match(text):
+    text = str(text).strip()
+    if not text:
+        return
+    if keyword not in text.casefold():
+        return
+    if text not in matches:
+        matches.append(text)
+
+for unit in report.get("analysis", {}).get("units", []):
+    add_match(unit.get("name", ""))
+    for dimension in unit.get("dimensions", {}).values():
+        add_match(dimension.get("highlight", ""))
+        for field in ("strengths", "improvements"):
+            for item in dimension.get(field, []):
+                add_match(item)
+    for items in unit.get("priority_suggestions", {}).values():
+        for item in items:
+            add_match(item)
+
+for item in report.get("results", []):
+    for key in ("group", "sheet", "status", "link"):
+        add_match(item.get(key, ""))
+
+for line in str(report.get("analysis", {}).get("raw_text", "")).splitlines():
+    add_match(line)
+
+for line in matches[:10]:
+    print(line)
+PY
+}
 
 view_report() {
     local date_input="${1:-today}"
@@ -473,6 +766,7 @@ view_report() {
     echo ""
 
     local report_file="$REPORTS_DIR/report_${date}.txt"
+    local json_file="$REPORTS_DIR/report_${date}.json"
     local pdf_file="$REPORTS_DIR/report_${date}.pdf"
     local html_file="$REPORTS_DIR/report_${date}.html"
 
@@ -483,19 +777,28 @@ view_report() {
         echo ""
     fi
 
-    if [ -f "$pdf_file" ]; then
-        print_success "✓ 找到PDF报告"
-        print_info "📊 打开: $pdf_file"
-        open "$pdf_file"
+    if [ -f "$json_file" ]; then
+        print_success "✓ 找到JSON结构化报告"
+        print_info "🧩 路径: $json_file"
         echo ""
     fi
 
-    if [ -f "$report_file" ]; then
-        print_success "✓ 找到文本报告"
+    if [ -f "$json_file" ]; then
+        print_success "✓ 使用JSON结构化报告摘要"
+        echo ""
+        show_json_report_summary "$json_file"
+        echo ""
+    elif [ -f "$report_file" ]; then
+        print_success "✓ 使用文本兼容报告"
         echo ""
         cat "$report_file"
         echo ""
-    else
+    fi
+
+    if [ -f "$pdf_file" ]; then
+        print_info "📊 已存在PDF兼容报告: $pdf_file"
+        echo ""
+    elif [ ! -f "$html_file" ] && [ ! -f "$json_file" ]; then
         print_warning "⚠️  未找到 $date 的报告"
         echo ""
         show_available_dates
@@ -518,21 +821,41 @@ search_reports() {
 
     local found=0
 
-    # Search in all reports
-    for report in "$REPORTS_DIR"/report_*.txt; do
-        if [ -f "$report" ]; then
-            local matches=$(grep -i "$keyword" "$report" | wc -l | tr -d ' ')
-            if [ "$matches" -gt 0 ]; then
-                local basename=$(basename "$report")
-                local date=$(echo "$basename" | sed 's/report_\(.*\)\.txt/\1/')
+    while IFS=$'\t' read -r date report_kind report_path; do
+        [ -n "$date" ] || continue
 
-                print_success "📅 $date ($matches 处匹配)"
-                grep -i --color=always -B 1 -A 1 "$keyword" "$report" | head -20
+        local run_label=""
+        case "$(basename "$report_path")" in
+            report_${date}__*)
+                local run_id
+                run_id=$(basename "$report_path" | sed -E "s/^report_${date}__(.*)\.(json|txt)$/\\1/")
+                run_label=" [run ${run_id}]"
+                ;;
+        esac
+
+        if [ "$report_kind" = "json" ] && [ -f "$report_path" ]; then
+            local json_matches
+            json_matches=$(search_json_report "$report_path" "$keyword")
+            if [ -n "$json_matches" ]; then
+                print_success "📅 $date${run_label} (JSON命中)"
+                echo "$json_matches" | head -10
+                echo ""
+                found=1
+            fi
+            continue
+        fi
+
+        if [ "$report_kind" = "txt" ] && [ -f "$report_path" ]; then
+            local matches
+            matches=$(grep -i "$keyword" "$report_path" | wc -l | tr -d ' ')
+            if [ "$matches" -gt 0 ]; then
+                print_success "📅 $date${run_label} ($matches 处文本匹配)"
+                grep -i --color=always -B 1 -A 1 "$keyword" "$report_path" | head -20
                 echo ""
                 found=1
             fi
         fi
-    done
+    done < <(list_search_targets)
 
     if [ $found -eq 0 ]; then
         print_warning "⚠️  未找到包含 '$keyword' 的报告"
@@ -545,26 +868,42 @@ list_reports() {
 
     local count=0
 
-    # List all reports, sorted by date (newest first)
-    for report in $(ls -t "$REPORTS_DIR"/report_*.txt 2>/dev/null); do
-        if [ -f "$report" ]; then
-            local basename=$(basename "$report")
-            local date=$(echo "$basename" | sed 's/report_\(.*\)\.txt/\1/')
+    for date in $(list_report_dates); do
+        if [ -n "$date" ]; then
+            local report="$REPORTS_DIR/report_${date}.txt"
+            local json_file="$REPORTS_DIR/report_${date}.json"
             local pdf_file="$REPORTS_DIR/report_${date}.pdf"
             local html_file="$REPORTS_DIR/report_${date}.html"
 
-            local file_info="📄 TXT"
-            if [ -f "$pdf_file" ]; then
-                file_info="📄 TXT + 📊 PDF"
-            fi
+            local file_info=""
             if [ -f "$html_file" ]; then
-                file_info="$file_info + 🌐 HTML"
+                file_info="🌐 HTML"
+            fi
+            if [ -f "$json_file" ]; then
+                file_info="${file_info:+$file_info + }🧩 JSON"
+            fi
+            if [ -f "$report" ]; then
+                file_info="${file_info:+$file_info + }📄 TXT"
+            fi
+            if [ -f "$pdf_file" ]; then
+                file_info="${file_info:+$file_info + }📊 PDF"
             fi
 
-            # Get first line (title) from report
-            local title=$(head -1 "$report" | sed 's/^=* *//' | sed 's/ *=*$//')
+            local title="早会质量评估报告"
+            if [ -f "$json_file" ]; then
+                title=$(get_json_report_title "$json_file")
+            elif [ -f "$report" ]; then
+                title=$(head -1 "$report" | sed 's/^=* *//' | sed 's/ *=*$//')
+            fi
 
-            echo "  $date  $file_info"
+            local run_count
+            run_count=$(get_report_run_count "$date")
+            local run_info=""
+            if [ "${run_count:-0}" -gt 1 ]; then
+                run_info=" (${run_count} 次运行)"
+            fi
+
+            echo "  $date${run_info}  $file_info"
             echo "    $title"
             echo ""
 
@@ -605,9 +944,9 @@ check_status() {
     fi
 
     if [ -f "$SCRIPTS_DIR/generate_pdf_report.py" ]; then
-        print_success "✓ PDF生成脚本"
+        print_success "✓ PDF兼容生成脚本"
     else
-        print_error "✗ PDF生成脚本不存在"
+        print_error "✗ PDF兼容生成脚本不存在"
     fi
 
     if [ -f "$SCRIPTS_DIR/generate_html_report.py" ]; then
@@ -617,7 +956,7 @@ check_status() {
     fi
 
     # Check Chrome debug mode
-    if pgrep -f "remote-debugging-port=9222" > /dev/null; then
+    if pgrep -f "remote-debugging-port=${CDP_PORT}" > /dev/null; then
         print_success "✓ Chrome调试模式运行中"
     else
         print_warning "⚠️  Chrome调试模式未运行"
@@ -636,14 +975,22 @@ check_status() {
     echo ""
     print_info "📦 Python依赖:"
 
+    check_python_runtime
     python3 -c "import playwright" 2>/dev/null && print_success "✓ playwright" || print_error "✗ playwright"
     python3 -c "import pandas" 2>/dev/null && print_success "✓ pandas" || print_error "✗ pandas"
     python3 -c "import reportlab" 2>/dev/null && print_success "✓ reportlab" || print_error "✗ reportlab"
+    python3 -c "from google import genai" 2>/dev/null && print_success "✓ google-genai" || print_error "✗ google-genai"
+    if python3 "$SCRIPTS_DIR/check_cdp_connection.py" --base-url "http://${CDP_HOST}:${CDP_PORT}" --quiet >/dev/null 2>&1; then
+        print_success "✓ Playwright CDP连接"
+    else
+        print_warning "⚠️  Playwright CDP连接失败（Chrome端口可用，但自动化握手未通过）"
+    fi
 
     # Check reports directory
     echo ""
     if [ -d "$REPORTS_DIR" ]; then
-        local report_count=$(ls -1 "$REPORTS_DIR"/report_*.txt 2>/dev/null | wc -l | tr -d ' ')
+        local report_count
+        report_count=$(list_report_dates | wc -l | tr -d ' ')
         print_success "✓ 报告目录: $report_count 个报告"
     else
         print_warning "⚠️  报告目录不存在"
@@ -663,8 +1010,10 @@ show_available_dates() {
     for i in {0..6}; do
         local check_date=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "${i} days ago" +%Y-%m-%d)
         local report_file="$REPORTS_DIR/report_${check_date}.txt"
+        local json_file="$REPORTS_DIR/report_${check_date}.json"
+        local html_file="$REPORTS_DIR/report_${check_date}.html"
 
-        if [ -f "$report_file" ]; then
+        if [ -f "$report_file" ] || [ -f "$json_file" ] || [ -f "$html_file" ]; then
             print_success "  ✓ $check_date"
             found=1
         else
@@ -703,6 +1052,12 @@ show_help() {
   /ding-check view 昨天
   /ding-check view 2026-03-02
 
+  # 启用兼容文本报告
+  DINGCHECK_GENERATE_TXT=1 /ding-check
+
+  # 启用兼容PDF报告
+  DINGCHECK_GENERATE_PDF=1 /ding-check
+
   # 搜索关键词
   /ding-check search 风险
   /ding-check search 未完成
@@ -718,6 +1073,8 @@ show_help() {
   ✓ 自动启动 - 自动启动Chrome调试模式
   ✓ 交互式选择 - 灵活选择要检查的业务单元
   ✓ 全自动化 - 一条命令完成所有操作
+  ✓ HTML/JSON 优先 - 默认以结构化数据和HTML报告为主
+  ✓ TXT/PDF 兼容 - 兼容保留，不再作为默认主路径
 EOF
 }
 
@@ -789,6 +1146,7 @@ main() {
     local first_arg="${1:-}"
     local date=""
     local selected_units=""
+    local report_scope_label=""
 
     # 子命令处理
     case "$first_arg" in
@@ -835,6 +1193,7 @@ main() {
                 if [[ -n "$theater_units" ]]; then
                     # 找到战队，使用战队下的所有单元
                     selected_units="$theater_units"
+                    report_scope_label="$first_arg"
                     print_info "📋 检查战队: $first_arg"
                     local unit_count=$(echo "$selected_units" | tr ',' '\n' | wc -l | tr -d ' ')
                     echo "   包含单元数: $unit_count"
@@ -867,7 +1226,9 @@ main() {
 
     # 3. 如果没有指定单元，交互式选择
     if [[ -z "$selected_units" ]]; then
-        selected_units=$(select_units_interactive)
+        local selection_result
+        selection_result=$(select_units_interactive)
+        IFS=$'\t' read -r selected_units report_scope_label <<< "$selection_result"
         echo ""
     fi
 
@@ -877,7 +1238,7 @@ main() {
     fi
 
     # 4. 运行检查
-    run_daily_check "$date" "$selected_units"
+    run_daily_check "$date" "$selected_units" "$report_scope_label"
 }
 
 # Run main function
