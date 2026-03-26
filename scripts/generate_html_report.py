@@ -354,6 +354,49 @@ def render_raw_analysis_html(raw_text):
         </div>
     """
 
+
+def render_dimension_comparison_html(units):
+    """渲染业务单元五维度横向对比。"""
+    if not units:
+        return ""
+
+    cards = []
+    for unit in units:
+        scores = unit.get("scores", {})
+        score_rows = []
+        for key in DIMENSION_KEYS:
+            score_rows.append(
+                f"""
+                <div class="dimension-compare-row">
+                    <span class="dimension-compare-label">{escape(key)}</span>
+                    <span class="dimension-compare-score">{scores.get(key, 0)}/5</span>
+                </div>
+                """
+            )
+
+        cards.append(
+            f"""
+            <div class="dimension-compare-card">
+                <div class="dimension-compare-header">
+                    <div class="dimension-compare-name">{escape(unit.get('name', ''))}</div>
+                    <div class="dimension-compare-total">{unit.get('total', 0)}/25</div>
+                </div>
+                <div class="dimension-compare-body">
+                    {''.join(score_rows)}
+                </div>
+            </div>
+            """
+        )
+
+    return f"""
+        <div class="table-card">
+            <h3>🧭 各业务单元五维度对比</h3>
+            <div class="dimension-compare-grid">
+                {''.join(cards)}
+            </div>
+        </div>
+    """
+
 def generate_html_report(report_file, output_file):
     """生成HTML可视化报告"""
     report_data = load_report_data(report_file)
@@ -378,6 +421,7 @@ def generate_html_report(report_file, output_file):
     capture_results_html = render_capture_results_html(results)
     discipline_alerts_html = render_discipline_alerts_html(results)
     unit_detail_html = render_unit_detail_cards(units)
+    dimension_compare_html = render_dimension_comparison_html(units)
     raw_analysis_html = render_raw_analysis_html(raw_text)
 
     # 处理无数据情况
@@ -636,6 +680,10 @@ def generate_html_report(report_file, output_file):
             height: 300px;
         }}
 
+        .chart-container.chart-tall {{
+            height: 380px;
+        }}
+
         .table-card {{
             background: white;
             border-radius: 12px;
@@ -751,6 +799,66 @@ def generate_html_report(report_file, output_file):
             color: #355f9f;
             border-radius: 999px;
             padding: 6px 10px;
+        }}
+
+        .dimension-compare-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+        }}
+
+        .dimension-compare-card {{
+            border: 1px solid #e8eaed;
+            border-radius: 14px;
+            padding: 18px;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+        }}
+
+        .dimension-compare-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 14px;
+        }}
+
+        .dimension-compare-name {{
+            font-size: 17px;
+            font-weight: 700;
+            color: #202124;
+        }}
+
+        .dimension-compare-total {{
+            font-size: 16px;
+            font-weight: 700;
+            color: #1a73e8;
+            white-space: nowrap;
+        }}
+
+        .dimension-compare-body {{
+            display: grid;
+            gap: 10px;
+        }}
+
+        .dimension-compare-row {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 8px 10px;
+            border-radius: 10px;
+            background: #f6f9fe;
+        }}
+
+        .dimension-compare-label {{
+            color: #5f6368;
+            font-size: 14px;
+        }}
+
+        .dimension-compare-score {{
+            font-size: 15px;
+            font-weight: 700;
+            color: #202124;
         }}
 
         .discipline-pill {{
@@ -1129,12 +1237,21 @@ def generate_html_report(report_file, output_file):
             </div>
 
             <div class="chart-card">
+                <h3>🧭 各业务单元五维度横向对比</h3>
+                <div class="chart-container chart-tall">
+                    <canvas id="unitDimensionChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-card">
                 <h3>🎯 五维度平均得分</h3>
                 <div class="chart-container">
                     <canvas id="dimensionChart"></canvas>
                 </div>
             </div>
         </div>
+
+        {dimension_compare_html}
 
         {group_summary_html}
 
@@ -1193,6 +1310,26 @@ def generate_html_report(report_file, output_file):
     top_units = units[:10]
     unit_names = [u['name'] for u in top_units]
     unit_scores = [u['total'] for u in top_units]
+    compare_units = units[:12]
+    compare_unit_names = [u['name'] for u in compare_units]
+    dimension_colors = {
+        '战果汇报': ('rgba(26, 115, 232, 0.78)', 'rgba(26, 115, 232, 1)'),
+        '任务聚焦': ('rgba(52, 168, 83, 0.78)', 'rgba(52, 168, 83, 1)'),
+        '协同效率': ('rgba(251, 188, 5, 0.78)', 'rgba(251, 188, 5, 1)'),
+        '情报敏感': ('rgba(234, 67, 53, 0.78)', 'rgba(234, 67, 53, 1)'),
+        '点评效率': ('rgba(123, 97, 255, 0.78)', 'rgba(123, 97, 255, 1)'),
+    }
+    unit_dimension_datasets = [
+        {
+            'label': key,
+            'data': [unit.get('scores', {}).get(key, 0) for unit in compare_units],
+            'backgroundColor': dimension_colors[key][0],
+            'borderColor': dimension_colors[key][1],
+            'borderWidth': 1,
+            'borderRadius': 6,
+        }
+        for key in DIMENSION_KEYS
+    ]
 
     html += f"""                </tbody>
             </table>
@@ -1239,6 +1376,44 @@ def generate_html_report(report_file, output_file):
                         max: 25,
                         ticks: {{
                             stepSize: 5
+                        }}
+                    }}
+                }}
+            }}
+        }});
+
+        // 各业务单元五维度横向对比
+        const unitDimensionCtx = document.getElementById('unitDimensionChart').getContext('2d');
+        new Chart(unitDimensionCtx, {{
+            type: 'bar',
+            data: {{
+                labels: {json.dumps(compare_unit_names, ensure_ascii=False)},
+                datasets: {json.dumps(unit_dimension_datasets, ensure_ascii=False)}
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {{
+                    mode: 'index',
+                    intersect: false
+                }},
+                plugins: {{
+                    legend: {{
+                        position: 'bottom'
+                    }}
+                }},
+                scales: {{
+                    x: {{
+                        ticks: {{
+                            maxRotation: 0,
+                            minRotation: 0
+                        }}
+                    }},
+                    y: {{
+                        beginAtZero: true,
+                        max: 5,
+                        ticks: {{
+                            stepSize: 1
                         }}
                     }}
                 }}

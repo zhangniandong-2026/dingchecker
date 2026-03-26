@@ -1,5 +1,5 @@
 ---
-name: ding-check
+name: ding-checker
 description: DingTalk daily meeting check automation with fixed URL and interactive unit selection. Automatically starts Chrome, opens document, extracts business unit reports, and generates comprehensive analysis.
 ---
 
