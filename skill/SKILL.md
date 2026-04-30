@@ -1,41 +1,67 @@
 ---
 name: ding-checker
-description: DingTalk daily meeting check automation with fixed URL and interactive unit selection. Automatically starts Chrome, opens document, extracts business unit reports, and generates comprehensive analysis.
+description: DingTalk daily meeting quality analysis with a fixed summary document. Opens the fixed DingTalk AI transcript summary page, lets managers manually open the transcript pages they want to analyze, then extracts transcripts and generates JSON/HTML reports.
 ---
 
 # DingTalk Daily Check Skill
 
-自动化检查钉钉日会听记内容，提取业务单元报告，生成分析结果。
+自动化分析钉钉日会听记内容，提取业务单元转写，生成业务单元横向比较报告。
+
+默认推荐使用 `collect` 半自动模式：系统自动打开固定钉钉 AI 听记汇总页，管理者只需要在浏览器里手动点击想分析的 AI 听记链接，dingchecker 负责后续的转写提取、质量评分和 HTML 报告生成。
 
 ## 核心特性
 
-- 🔗 **固定URL**：自动使用配置的钉钉文档，无需每次输入
-- 🤖 **全自动化**：自动启动Chrome、自动打开URL、自动检查
+- 🔗 **固定汇总页**：所有人默认使用同一个钉钉 AI 听记汇总页，无需提供链接
+- 🧭 **半自动收集（推荐）**：自动打开汇总页，管理者人工点击要分析的听记页
+- 🤖 **自动分析**：自动提取转写、识别业务单元、AI 评分并生成报告
 - 🎯 **交互式选择**：灵活选择要检查的业务单元（全部、按战队、部分）
-- 📊 **多格式报告**：生成文本、PDF 和 HTML 三种格式
+- 📊 **HTML/JSON 报告**：默认生成结构化 JSON 和可视化 HTML，TXT/PDF 仅兼容保留
 - 🔍 **风险检测**：自动识别关键风险点
 - 📅 **历史管理**：查看、搜索历史报告
 - ⚡ **实时反馈**：清晰的执行状态和错误提示
 
 ## 快速开始
 
-### 最简单的使用方式
+### 推荐使用方式
 
 ```bash
-# 一条命令完成所有操作
-/ding-check
+/ding-check collect 华北东北战区
 ```
 
 **执行流程**：
 1. ✓ 自动启动Chrome调试模式（如未运行）
-2. ✓ 自动打开固定的钉钉文档URL
-3. ✓ 显示交互式菜单，选择要检查的业务单元
-4. ✓ 提取数据并生成报告
-5. ✓ 自动打开HTML可视化报告（并保留 PDF）
+2. ✓ 自动打开固定的钉钉 AI 听记汇总页
+3. ✓ 管理者在浏览器中筛选日期，手动点击想分析的 AI 听记链接
+4. ✓ dingchecker 收集已打开的听记页并识别业务单元
+5. ✓ 提取转写、AI 评分并生成 HTML 横向比较报告
 
 ## 使用方法
 
-### 1. 主检查功能（交互式）
+### 1. 推荐：半自动收集已打开听记页
+
+```bash
+# 检查今天
+/ding-check collect 华北东北战区
+
+# 检查指定日期
+/ding-check collect 华北东北战区 2026-04-21
+```
+
+系统会自动打开固定汇总页：
+
+```text
+https://alidocs.dingtalk.com/i/nodes/93NwLYZXWygvM0mMuk4O7vj7JkyEqBQm
+```
+
+管理者只需要：
+
+- 在汇总页筛选或定位当天日期
+- 人工判断哪些业务单元今天实际开会
+- 手动点击这些业务单元的 AI 听记链接
+- 确认听记页能正常打开且有权限
+- 回到对话或终端继续，让 dingchecker 自动生成报告
+
+### 2. 兼容：全自动检查功能（不推荐作为默认）
 
 ```bash
 # 检查今天（弹出菜单选择单元）
@@ -44,6 +70,8 @@ description: DingTalk daily meeting check automation with fixed URL and interact
 # 检查指定日期（也会弹出菜单）
 /ding-check 2026-03-02
 ```
+
+全自动模式会尝试自动切换钉钉工作表、定位日期行和听记链接。由于钉钉文档 DOM 和权限状态不稳定，日常管理建议优先使用 `collect`。
 
 **交互式菜单示例**：
 ```
@@ -85,7 +113,7 @@ description: DingTalk daily meeting check automation with fixed URL and interact
 - 输入 `北京非金一组,东北组` - 只检查这两个单元
 - 直接按Enter - 默认检查所有单元
 
-### 2. 查看历史报告
+### 3. 查看历史报告
 
 ```bash
 # 查看今天的报告
@@ -98,7 +126,7 @@ description: DingTalk daily meeting check automation with fixed URL and interact
 /ding-check view 2026-03-02
 ```
 
-### 3. 搜索报告内容
+### 4. 搜索报告内容
 
 在所有历史报告中搜索关键词：
 
@@ -113,7 +141,7 @@ description: DingTalk daily meeting check automation with fixed URL and interact
 /ding-check search 北京非金
 ```
 
-### 4. 列出历史报告
+### 5. 列出历史报告
 
 ```bash
 /ding-check list
@@ -121,7 +149,7 @@ description: DingTalk daily meeting check automation with fixed URL and interact
 
 显示所有历史报告的列表，包括日期、标题和文件类型。
 
-### 5. 检查系统状态
+### 6. 检查系统状态
 
 ```bash
 /ding-check status
