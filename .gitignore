@@ -51,3 +51,6 @@ __pycache__/
 *_api_key*
 *_secret*
 *_token*
+
+# 钉钉机器人 webhook（含 access_token 和 secret，禁止提交）
+config/dingtalk_webhook.json
