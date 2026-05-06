@@ -1,21 +1,71 @@
-# DingChecker
+# DingChecker v4.0
 
-钉钉晨会听记检查与 AI 评估工具。
+钉钉晨会听记分析工具 - 基于 dws CLI + Claude Code 本地分析
 
-当前主链已经收敛为：
+**核心改进**：
+- ✅ 无需 Chrome/CDP（代码量减少80%）
+- ✅ 无需 Gemini API Key（本地 Claude 分析）
+- ✅ 完整逐字稿分析（148段 vs 旧版仅摘要）
+- ✅ 精确发言时长统计（毫秒级）
+- ✅ 四维度评分体系（总分20分）
 
-`DingTalk / AI 听记 -> 结构化 JSON -> HTML 报告`
+## 评分体系
 
-默认产物是 `HTML + JSON`，`TXT/PDF` 仅作为兼容产物保留。
+**四维度（总分20分）**：
+1. **昨日战果** (1-5分) - 是否清晰汇报昨天成果
+2. **今日计划** (1-5分) - 是否有明确的今日任务
+3. **协同效率** (1-5分) - 管理者+协同方响应是否及时
+4. **点评效率** (1-5分) - 管理者指导是否有力（20-30%时长占比）
 
-## 当前能力
+详细标准：[docs/meeting_guidelines_v4.md](docs/meeting_guidelines_v4.md)
 
-- 自动连接 Chrome CDP，会话内复用已登录的钉钉状态
-- 支持按单业务单元、战队、战区批量检查
-- 自动提取 AI 听记内容，生成战队/战区横向比较报告
-- 使用 `google-genai` 做 5 维度晨会质量评估
-- 默认生成结构化 `JSON` 与可视化 `HTML`
-- 支持报告归档 `run_id`，避免同日重跑互相覆盖
+## 技术架构
+
+**数据流**：
+```
+AiTable (29业务单元) → dws CLI API → 完整转写(148段) 
+  → 发言人时长统计 → Claude Code 分析 → Markdown 报告
+```
+
+**优势**：
+- 数据完整可控（原始转写 vs AI摘要）
+- 无外部依赖（无需 Gemini API Key）
+- 可精确量化（发言时长、关键词频率）
+- 成本为零（本地 Claude 分析）
+
+## 快速开始
+
+### 1. 前置条件
+
+系统会自动安装和认证 dws CLI，无需手动配置。
+
+### 2. 推荐使用方式：collect
+
+```bash
+# 分析单个业务单元今天的早会
+/ding-check collect 东北组
+
+# 分析整个战队昨天的早会
+/ding-check collect 政府头部战队 2026-04-29
+
+# 分析战区所有单元
+/ding-check collect 华北东北战区
+
+# 分析所有业务单元
+/ding-check collect 全部
+```
+
+### 3. 查看报告
+
+报告自动保存到 Obsidian vault：
+```
+~/.claude/Obsidian Vault/ai-output/dingtalk-minutes/report_YYYY-MM-DD.md
+```
+
+也可以用命令查看：
+```bash
+/ding-check view 2026-04-30
+```
 
 ## 仓库结构
 
@@ -78,29 +128,45 @@ bash /Users/zhangniandong/repos/dingchecker/chrome/start_chrome_debug.sh --port 
 
 首次启动后，请在这个 Chrome 实例里手动登录钉钉，登录态会保存在 `data/chrome_profiles/`。
 
-### 3. 运行检查
+### 3. 推荐运行方式：collect 半自动收集
 
-直接运行 skill 脚本：
+所有管理者默认使用同一个固定钉钉 AI 听记汇总页：
 
-```bash
-bash /Users/zhangniandong/repos/dingchecker/skill/skill.sh
+```text
+https://alidocs.dingtalk.com/i/nodes/93NwLYZXWygvM0mMuk4O7vj7JkyEqBQm
 ```
 
-指定战队 / 战区：
+运行：
+
+```bash
+DINGCHECK_CDP_PORT=9333 \
+bash /Users/zhangniandong/repos/dingchecker/skill/skill.sh collect 华北东北战区 2026-04-21
+```
+
+流程：
+
+1. 程序自动打开固定钉钉汇总页。
+2. 管理者在浏览器里筛选/定位日期。
+3. 管理者人工判断哪些业务单元开会，并手动点击要分析的 AI 听记链接。
+4. 确认听记页可访问后，回到终端或对话继续。
+5. dingchecker 扫描已打开的听记页，提取转写并生成横向比较报告。
+
+也可以通过 Codex Skill 自然语言调用，例如：
+
+```text
+用 ding-checker 检查今天华北东北战区早会
+```
+
+### 4. 兼容运行方式：全自动检查
+
+全自动模式仍保留，但不再作为推荐主路径，因为钉钉文档目录、日期行和链接列的 DOM 结构不稳定。
 
 ```bash
 DINGCHECK_CDP_PORT=9333 \
 bash /Users/zhangniandong/repos/dingchecker/skill/skill.sh 政府头部战队 2026-03-25
 ```
 
-指定单业务单元：
-
-```bash
-DINGCHECK_CDP_PORT=9333 \
-bash /Users/zhangniandong/repos/dingchecker/skill/skill.sh 交通行业组 2026-03-25
-```
-
-### 4. 查看结果
+### 5. 查看结果
 
 ```bash
 bash /Users/zhangniandong/repos/dingchecker/skill/skill.sh view 2026-03-25

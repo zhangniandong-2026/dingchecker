@@ -1,0 +1,8 @@
+{
+  "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN",
+  "secret": "",
+  "enabled": true,
+  "description": "早会报告推送目标群",
+  "push_time": "09:30",
+  "notes": "请在钉钉群中添加自定义机器人，然后将webhook URL和secret填入此文件"
+}
